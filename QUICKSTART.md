@@ -13,6 +13,33 @@ docker-compose --version
 git --version
 ```
 
+### Docker 권한 설정
+
+Docker를 sudo 없이 사용하려면 현재 사용자를 docker 그룹에 추가해야 합니다:
+
+```bash
+# 현재 사용자를 docker 그룹에 추가
+sudo usermod -aG docker $USER
+
+# 그룹 변경사항 확인
+id $USER
+
+# 변경사항 적용 (두 가지 방법 중 하나 선택)
+# 방법 1: 터미널 재시작 (권장)
+# 로그아웃 후 다시 로그인
+
+# 방법 2: 임시로 새 그룹 세션 시작
+newgrp docker
+
+# 권한 확인
+docker ps
+```
+
+**참고**:
+- docker 그룹 추가 후에는 반드시 **터미널을 재시작**하거나 **로그아웃/로그인**해야 합니다
+- 현재 세션에서만 임시로 사용하려면 `sg docker -c "명령어"` 형식을 사용할 수 있습니다
+  - 예: `sg docker -c "docker-compose -f docker-compose.dev.yml up -d"`
+
 ## 2. 환경 변수 설정
 
 ```bash
@@ -85,6 +112,20 @@ docker stats
 ```
 
 ## 6. 문제 해결
+
+### Docker 권한 에러 (Permission Denied)
+
+```bash
+# 에러 예시:
+# PermissionError: [Errno 13] Permission denied
+# docker.errors.DockerException: Error while fetching server API version
+
+# 해결 방법: 사용자를 docker 그룹에 추가
+sudo usermod -aG docker $USER
+
+# 로그아웃 후 다시 로그인하거나, 임시로 사용하려면:
+sg docker -c "docker-compose -f docker-compose.dev.yml up -d"
+```
 
 ### 컨테이너가 시작하지 않을 때
 
