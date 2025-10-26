@@ -1,0 +1,45 @@
+# 운영 환경용 Dockerfile - Multi-stage build
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+# 의존성 설치
+COPY package*.json ./
+RUN npm ci --only=production
+
+# 소스 복사 및 빌드
+COPY . .
+RUN npm run build
+
+# Nginx를 사용한 프로덕션 서빙
+FROM nginx:alpine
+
+# 보안: 비root 사용자로 실행
+RUN addgroup -S nginx-app && adduser -S nginx-app -G nginx-app
+
+# 빌드된 파일 복사
+COPY --from=build /app/build /usr/share/nginx/html
+
+# Nginx 설정 (SPA를 위한 fallback 설정)
+RUN echo 'server { \
+    listen 80; \
+    server_name localhost; \
+    root /usr/share/nginx/html; \
+    index index.html; \
+    location / { \
+        try_files $uri $uri/ /index.html; \
+    } \
+    location /health { \
+        access_log off; \
+        return 200 "OK"; \
+        add_header Content-Type text/plain; \
+    } \
+}' > /etc/nginx/conf.d/default.conf
+
+# 헬스체크
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD wget --quiet --tries=1 --spider http://localhost:80/health || exit 1
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
