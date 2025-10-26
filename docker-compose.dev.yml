@@ -1,0 +1,318 @@
+version: '3.8'
+
+# 개발 환경 Docker Compose 설정
+# 포트 오프셋을 사용하여 운영 환경과 충돌 방지
+
+networks:
+  devops-network-dev:
+    driver: bridge
+  backend-network-dev:
+    driver: bridge
+
+volumes:
+  mysql_data_dev:
+  qdrant_data_dev:
+  kafka_data_dev:
+  zookeeper_data_dev:
+  jenkins_home_dev:
+
+services:
+  # ========================================
+  # MySQL - 데이터베이스 (개발)
+  # ========================================
+  mysql-dev:
+    image: mysql:8.0
+    container_name: mysql-dev
+    restart: always
+    ports:
+      - "${MYSQL_PORT:-13306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data_dev:/var/lib/mysql
+      - ./database/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend-network-dev
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================================
+  # Qdrant - 벡터 데이터베이스 (개발)
+  # ========================================
+  qdrant-dev:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-dev
+    restart: always
+    ports:
+      - "${QDRANT_PORT:-16333}:6333"
+      - "${QDRANT_GRPC_PORT:-16334}:6334"
+    volumes:
+      - qdrant_data_dev:/qdrant/storage
+    networks:
+      - backend-network-dev
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ========================================
+  # Kafka & Zookeeper (개발)
+  # ========================================
+  zookeeper-dev:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper-dev
+    restart: always
+    ports:
+      - "12181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data_dev:/var/lib/zookeeper/data
+    networks:
+      - backend-network-dev
+
+  kafka-dev:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-dev
+    restart: always
+    ports:
+      - "19092:9092"
+    depends_on:
+      - zookeeper-dev
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-dev:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-dev:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data_dev:/var/lib/kafka/data
+    networks:
+      - backend-network-dev
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========================================
+  # Spring Boot (개발 - Blue)
+  # ========================================
+  spring-boot-blue-dev:
+    build:
+      context: ./backend/spring-boot
+      dockerfile: Dockerfile
+    container_name: spring-boot-blue-dev
+    restart: always
+    ports:
+      - "${BLUE_BACKEND_PORT:-18080}:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${SPRING_DB_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-dev:9092
+    volumes:
+      - ./backend/spring-boot:/app
+    networks:
+      - devops-network-dev
+      - backend-network-dev
+    depends_on:
+      - mysql-dev
+      - kafka-dev
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ========================================
+  # Spring Boot (개발 - Green)
+  # ========================================
+  spring-boot-green-dev:
+    build:
+      context: ./backend/spring-boot
+      dockerfile: Dockerfile
+    container_name: spring-boot-green-dev
+    restart: always
+    ports:
+      - "${GREEN_BACKEND_PORT:-18081}:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: ${SPRING_DB_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-dev:9092
+    volumes:
+      - ./backend/spring-boot:/app
+    networks:
+      - devops-network-dev
+      - backend-network-dev
+    depends_on:
+      - mysql-dev
+      - kafka-dev
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ========================================
+  # FastAPI (개발 - Blue)
+  # ========================================
+  fastapi-blue-dev:
+    build:
+      context: ./backend/fastapi
+      dockerfile: Dockerfile
+    container_name: fastapi-blue-dev
+    restart: always
+    ports:
+      - "${FASTAPI_PORT:-18000}:8000"
+    environment:
+      FASTAPI_ENV: ${FASTAPI_ENV:-development}
+      DATABASE_URL: ${FASTAPI_DB_URL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-dev:9092
+      QDRANT_HOST: qdrant-dev
+      QDRANT_PORT: 6333
+    volumes:
+      - ./backend/fastapi:/app
+    networks:
+      - devops-network-dev
+      - backend-network-dev
+    depends_on:
+      - mysql-dev
+      - kafka-dev
+      - qdrant-dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ========================================
+  # FastAPI (개발 - Green)
+  # ========================================
+  fastapi-green-dev:
+    build:
+      context: ./backend/fastapi
+      dockerfile: Dockerfile
+    container_name: fastapi-green-dev
+    restart: always
+    ports:
+      - "18001:8000"
+    environment:
+      FASTAPI_ENV: ${FASTAPI_ENV:-development}
+      DATABASE_URL: ${FASTAPI_DB_URL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-dev:9092
+      QDRANT_HOST: qdrant-dev
+      QDRANT_PORT: 6333
+    volumes:
+      - ./backend/fastapi:/app
+    networks:
+      - devops-network-dev
+      - backend-network-dev
+    depends_on:
+      - mysql-dev
+      - kafka-dev
+      - qdrant-dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ========================================
+  # React (개발 - Blue)
+  # ========================================
+  react-blue-dev:
+    build:
+      context: ./frontend/react
+      dockerfile: Dockerfile
+    container_name: react-blue-dev
+    restart: always
+    ports:
+      - "13000:3000"
+    volumes:
+      - ./frontend/react:/app
+      - /app/node_modules
+    networks:
+      - devops-network-dev
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - REACT_APP_API_URL=http://localhost:18080
+
+  # ========================================
+  # React (개발 - Green)
+  # ========================================
+  react-green-dev:
+    build:
+      context: ./frontend/react
+      dockerfile: Dockerfile
+    container_name: react-green-dev
+    restart: always
+    ports:
+      - "13001:3000"
+    volumes:
+      - ./frontend/react:/app
+      - /app/node_modules
+    networks:
+      - devops-network-dev
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - REACT_APP_API_URL=http://localhost:18081
+
+  # ========================================
+  # Jenkins (개발)
+  # ========================================
+  jenkins-dev:
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: jenkins-dev
+    restart: always
+    privileged: true
+    user: root
+    ports:
+      - "${JENKINS_PORT:-18080}:8080"
+      - "50001:50000"
+    volumes:
+      - jenkins_home_dev:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/workspace
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+      - JENKINS_ADMIN_USER=${JENKINS_ADMIN_USER}
+      - JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
+    networks:
+      - devops-network-dev
+      - backend-network-dev
+
+  # ========================================
+  # Adminer - 데이터베이스 관리 도구 (개발 전용)
+  # ========================================
+  adminer:
+    image: adminer:latest
+    container_name: adminer-dev
+    restart: always
+    ports:
+      - "18888:8080"
+    networks:
+      - backend-network-dev
+    depends_on:
+      - mysql-dev
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql-dev

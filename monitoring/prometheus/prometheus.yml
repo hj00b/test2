@@ -1,0 +1,81 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'prod'
+    environment: 'production'
+
+# Alertmanager 설정
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+# 스크래핑 대상 설정
+scrape_configs:
+  # Prometheus 자체 메트릭
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # NGINX 메트릭
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:9113']
+
+  # Spring Boot 메트릭
+  - job_name: 'spring-boot-blue'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['spring-boot-blue:8080']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'spring-boot-blue'
+
+  - job_name: 'spring-boot-green'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['spring-boot-green:8080']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'spring-boot-green'
+
+  # FastAPI 메트릭
+  - job_name: 'fastapi-blue'
+    static_configs:
+      - targets: ['fastapi-blue:8000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'fastapi-blue'
+
+  - job_name: 'fastapi-green'
+    static_configs:
+      - targets: ['fastapi-green:8000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'fastapi-green'
+
+  # MySQL 메트릭
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql-exporter:9104']
+
+  # Kafka 메트릭
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  # Jenkins 메트릭
+  - job_name: 'jenkins'
+    metrics_path: '/prometheus/'
+    static_configs:
+      - targets: ['jenkins:8080']
+
+  # Node Exporter (시스템 메트릭)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']

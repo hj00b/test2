@@ -1,0 +1,80 @@
+# 환경 변수 파일
+.env
+.env.prod
+.env.dev
+*.env
+
+# SSL 인증서
+nginx/certs/*.pem
+nginx/certs/*.key
+nginx/certs/*.crt
+
+# 로그 파일
+*.log
+logs/
+
+# 데이터 볼륨
+data/
+volumes/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+secrets/
+*.secret
+
+# Jenkins
+jenkins/secrets/
+jenkins/.jenkins/
+
+# GitLab
+gitlab/config/
+gitlab/logs/
+gitlab/data/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# React
+build/
+dist/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv
+
+# Java
+target/
+*.jar
+*.war
+*.ear
+*.class
+
+# Docker
+.dockerignore
+
+# Backup
+backup/
+*.bak
+*.backup

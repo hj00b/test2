@@ -1,0 +1,13 @@
+git:latest
+gitlab-plugin:latest
+docker-plugin:latest
+docker-workflow:latest
+pipeline-stage-view:latest
+workflow-aggregator:latest
+credentials-binding:latest
+blueocean:latest
+generic-webhook-trigger:latest
+pipeline-utility-steps:latest
+slack:latest
+email-ext:latest
+prometheus:latest

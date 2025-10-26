@@ -1,0 +1,492 @@
+version: '3.8'
+
+# 운영 환경 Docker Compose 설정
+# 블루-그린 배포를 지원합니다
+
+networks:
+  devops-network:
+    driver: bridge
+  backend-network:
+    driver: bridge
+  monitoring-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  qdrant_data:
+  kafka_data:
+  zookeeper_data:
+  jenkins_home:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # ========================================
+  # NGINX - 리버스 프록시 & 로드밸런서
+  # ========================================
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: nginx-prod
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/letsencrypt:rw
+      - ./nginx/certs/www:/var/www/certbot:rw
+    environment:
+      - DOMAIN_FRONTEND=${DOMAIN_FRONTEND}
+      - DOMAIN_API=${DOMAIN_API}
+      - DOMAIN_GITLAB=${DOMAIN_GITLAB}
+      - DOMAIN_JENKINS=${DOMAIN_JENKINS}
+      - ACTIVE_ENVIRONMENT=${ACTIVE_ENVIRONMENT:-blue}
+    networks:
+      - devops-network
+    depends_on:
+      - spring-boot-blue
+      - spring-boot-green
+      - fastapi-blue
+      - fastapi-green
+      - react-blue
+      - react-green
+      - jenkins
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Certbot for Let's Encrypt
+  certbot:
+    image: certbot/certbot:latest
+    container_name: certbot-prod
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt:rw
+      - ./nginx/certs/www:/var/www/certbot:rw
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - devops-network
+
+  # ========================================
+  # Jenkins - CI/CD
+  # ========================================
+  jenkins:
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: jenkins-prod
+    restart: always
+    privileged: true
+    user: root
+    ports:
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/workspace
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+      - JENKINS_ADMIN_USER=${JENKINS_ADMIN_USER}
+      - JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
+    networks:
+      - devops-network
+      - backend-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # MySQL - 데이터베이스
+  # ========================================
+  mysql-prod:
+    build:
+      context: ./database/mysql
+      dockerfile: Dockerfile
+    container_name: mysql-prod
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./database/mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    networks:
+      - backend-network
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # MySQL Exporter (Prometheus)
+  mysql-exporter:
+    image: prom/mysqld-exporter:latest
+    container_name: mysql-exporter-prod
+    restart: always
+    environment:
+      DATA_SOURCE_NAME: "${MYSQL_USER}:${MYSQL_PASSWORD}@(mysql-prod:3306)/"
+    networks:
+      - backend-network
+      - monitoring-network
+    depends_on:
+      - mysql-prod
+
+  # ========================================
+  # Qdrant - 벡터 데이터베이스
+  # ========================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-prod
+    restart: always
+    ports:
+      - "${QDRANT_PORT}:6333"
+      - "${QDRANT_GRPC_PORT}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./database/qdrant/config.yaml:/qdrant/config/config.yaml:ro
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Kafka & Zookeeper
+  # ========================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper-prod
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - backend-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-prod
+    restart: always
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID}
+      KAFKA_ZOOKEEPER_CONNECT: ${KAFKA_ZOOKEEPER_CONNECT}
+      KAFKA_ADVERTISED_LISTENERS: ${KAFKA_ADVERTISED_LISTENERS}
+      KAFKA_LISTENERS: ${KAFKA_LISTENERS}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Kafka Exporter (Prometheus)
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter-prod
+    restart: always
+    command: ["--kafka.server=kafka-prod:9092"]
+    networks:
+      - backend-network
+      - monitoring-network
+    depends_on:
+      - kafka
+
+  # ========================================
+  # Spring Boot (Blue Environment)
+  # ========================================
+  spring-boot-blue:
+    build:
+      context: ./backend/spring-boot
+      dockerfile: Dockerfile.prod
+    container_name: spring-boot-blue
+    restart: always
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILE}
+      SPRING_DATASOURCE_URL: ${SPRING_DB_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-prod:9092
+    networks:
+      - devops-network
+      - backend-network
+    depends_on:
+      - mysql-prod
+      - kafka
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Spring Boot (Green Environment)
+  # ========================================
+  spring-boot-green:
+    build:
+      context: ./backend/spring-boot
+      dockerfile: Dockerfile.prod
+    container_name: spring-boot-green
+    restart: always
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILE}
+      SPRING_DATASOURCE_URL: ${SPRING_DB_URL}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-prod:9092
+    networks:
+      - devops-network
+      - backend-network
+    depends_on:
+      - mysql-prod
+      - kafka
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # FastAPI (Blue Environment)
+  # ========================================
+  fastapi-blue:
+    build:
+      context: ./backend/fastapi
+      dockerfile: Dockerfile.prod
+    container_name: fastapi-blue
+    restart: always
+    environment:
+      FASTAPI_ENV: ${FASTAPI_ENV}
+      DATABASE_URL: ${FASTAPI_DB_URL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-prod:9092
+      QDRANT_HOST: qdrant-prod
+      QDRANT_PORT: 6333
+    networks:
+      - devops-network
+      - backend-network
+    depends_on:
+      - mysql-prod
+      - kafka
+      - qdrant
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # FastAPI (Green Environment)
+  # ========================================
+  fastapi-green:
+    build:
+      context: ./backend/fastapi
+      dockerfile: Dockerfile.prod
+    container_name: fastapi-green
+    restart: always
+    environment:
+      FASTAPI_ENV: ${FASTAPI_ENV}
+      DATABASE_URL: ${FASTAPI_DB_URL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka-prod:9092
+      QDRANT_HOST: qdrant-prod
+      QDRANT_PORT: 6333
+    networks:
+      - devops-network
+      - backend-network
+    depends_on:
+      - mysql-prod
+      - kafka
+      - qdrant
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # React (Blue Environment)
+  # ========================================
+  react-blue:
+    build:
+      context: ./frontend/react
+      dockerfile: Dockerfile.prod
+    container_name: react-blue
+    restart: always
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # React (Green Environment)
+  # ========================================
+  react-green:
+    build:
+      context: ./frontend/react
+      dockerfile: Dockerfile.prod
+    container_name: react-green
+    restart: always
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Prometheus - 메트릭 수집
+  # ========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus-prod
+    restart: always
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring-network
+      - backend-network
+      - devops-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Grafana - 메트릭 시각화
+  # ========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-prod
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - monitoring-network
+      - devops-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Node Exporter - 시스템 메트릭
+  # ========================================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter-prod
+    restart: always
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - monitoring-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

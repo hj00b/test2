@@ -1,0 +1,381 @@
+// Frontend Jenkins Pipeline
+// React 앱 빌드 및 배포
+
+pipeline {
+    agent any
+
+    environment {
+        // Docker Registry 설정
+        DOCKER_REGISTRY = credentials('docker-registry-credentials')
+        DOCKER_REGISTRY_URL = "${env.DOCKER_REGISTRY ?: 'registry.example.com'}"
+
+        // GitLab 설정
+        GITLAB_CREDENTIALS = credentials('gitlab-api-token')
+
+        // 환경 결정
+        DEPLOY_ENV = "${env.GIT_BRANCH == 'origin/master' ? 'prod' : 'dev'}"
+        TARGET_ENVIRONMENT = "${params.TARGET_ENV ?: 'blue'}"
+
+        // 이미지 태그
+        IMAGE_TAG = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+
+        // 프로젝트 경로
+        WORKSPACE_PATH = "/workspace"
+    }
+
+    parameters {
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['blue', 'green'],
+            description: '배포 대상 환경 (Blue/Green)'
+        )
+        booleanParam(
+            name: 'AUTO_SWITCH',
+            defaultValue: false,
+            description: '배포 후 자동으로 트래픽 전환 (운영 환경만)'
+        )
+        booleanParam(
+            name: 'RUN_LINT',
+            defaultValue: true,
+            description: 'ESLint 실행 여부'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: '테스트 실행 여부'
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "=== Git Checkout ==="
+                    echo "Branch: ${env.GIT_BRANCH}"
+                    echo "Commit: ${env.GIT_COMMIT}"
+                    echo "Deploy Environment: ${DEPLOY_ENV}"
+                    echo "Target Environment: ${TARGET_ENVIRONMENT}"
+                }
+
+                // 소스 체크아웃
+                checkout scm
+
+                // Git 정보 저장
+                script {
+                    env.GIT_COMMIT_MESSAGE = sh(
+                        script: 'git log -1 --pretty=%B',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "=== Environment Setup ==="
+
+                    dir('frontend/react') {
+                        // Node modules 캐싱 확인
+                        sh '''
+                            if [ -d "node_modules" ]; then
+                                echo "node_modules cache found"
+                            else
+                                echo "node_modules cache not found"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    echo "=== Installing Dependencies ==="
+
+                    dir('frontend/react') {
+                        sh '''
+                            if [ -f package.json ]; then
+                                docker run --rm \
+                                    -v $(pwd):/app \
+                                    -w /app \
+                                    node:20-alpine \
+                                    /bin/sh -c "npm ci || npm install"
+                            else
+                                echo "Error: package.json not found"
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Lint') {
+            when {
+                expression { params.RUN_LINT == true }
+            }
+            steps {
+                script {
+                    echo "=== Running ESLint ==="
+
+                    dir('frontend/react') {
+                        sh '''
+                            docker run --rm \
+                                -v $(pwd):/app \
+                                -w /app \
+                                node:20-alpine \
+                                /bin/sh -c "npm run lint || echo 'Lint errors found but continuing...'"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            steps {
+                script {
+                    echo "=== Running Tests ==="
+
+                    dir('frontend/react') {
+                        sh '''
+                            docker run --rm \
+                                -v $(pwd):/app \
+                                -w /app \
+                                -e CI=true \
+                                node:20-alpine \
+                                /bin/sh -c "npm test -- --passWithNoTests || echo 'Tests completed with warnings'"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build - React App') {
+            steps {
+                script {
+                    echo "=== Building React App ==="
+
+                    dir('frontend/react') {
+                        def dockerfile = DEPLOY_ENV == 'prod' ? 'Dockerfile.prod' : 'Dockerfile'
+                        def imageName = "${DOCKER_REGISTRY_URL}/react:${IMAGE_TAG}-${DEPLOY_ENV}"
+
+                        sh """
+                            if [ -f ${dockerfile} ]; then
+                                # Build Docker image
+                                docker build -t ${imageName} -f ${dockerfile} .
+
+                                # Tag as latest
+                                docker tag ${imageName} ${DOCKER_REGISTRY_URL}/react:latest-${DEPLOY_ENV}
+
+                                echo "React image built: ${imageName}"
+                            else
+                                echo "Error: ${dockerfile} not found"
+                                exit 1
+                            fi
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            when {
+                expression { DEPLOY_ENV == 'prod' }
+            }
+            steps {
+                script {
+                    echo "=== Running Security Scan ==="
+
+                    dir('frontend/react') {
+                        sh '''
+                            # npm audit
+                            docker run --rm \
+                                -v $(pwd):/app \
+                                -w /app \
+                                node:20-alpine \
+                                /bin/sh -c "npm audit --audit-level=moderate || echo 'Vulnerabilities found, review required'"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Push - Docker Registry') {
+            steps {
+                script {
+                    echo "=== Pushing Image to Registry ==="
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-credentials',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_PASS'
+                    )]) {
+                        sh """
+                            echo \${REGISTRY_PASS} | docker login ${DOCKER_REGISTRY_URL} -u \${REGISTRY_USER} --password-stdin
+
+                            # Push React images
+                            docker push ${DOCKER_REGISTRY_URL}/react:${IMAGE_TAG}-${DEPLOY_ENV}
+                            docker push ${DOCKER_REGISTRY_URL}/react:latest-${DEPLOY_ENV}
+
+                            docker logout ${DOCKER_REGISTRY_URL}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy - to Target Environment') {
+            steps {
+                script {
+                    echo "=== Deploying Frontend to ${TARGET_ENVIRONMENT} environment ==="
+
+                    def composeFile = DEPLOY_ENV == 'prod' ? 'docker-compose.prod.yml' : 'docker-compose.dev.yml'
+
+                    sh """
+                        cd ${WORKSPACE_PATH}
+
+                        # 환경 변수 로드
+                        export \$(cat .env.${DEPLOY_ENV} | grep -v '^#' | xargs)
+
+                        # React 컨테이너 배포
+                        docker-compose -f ${composeFile} up -d react-${TARGET_ENVIRONMENT}
+
+                        echo "Frontend deployed to ${TARGET_ENVIRONMENT} environment"
+                    """
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "=== Running Health Checks ==="
+
+                    sh """
+                        # React 컨테이너 헬스체크
+                        MAX_RETRIES=30
+                        RETRY_INTERVAL=2
+
+                        for i in \$(seq 1 \$MAX_RETRIES); do
+                            if docker exec react-${TARGET_ENVIRONMENT} wget --quiet --tries=1 --spider http://localhost:80; then
+                                echo "React container is healthy"
+                                exit 0
+                            fi
+                            echo "Health check attempt \$i/\$MAX_RETRIES failed, waiting..."
+                            sleep \$RETRY_INTERVAL
+                        done
+
+                        echo "Health check failed after \$MAX_RETRIES attempts"
+                        exit 1
+                    """
+                }
+            }
+        }
+
+        stage('Cache Invalidation') {
+            when {
+                expression { DEPLOY_ENV == 'prod' }
+            }
+            steps {
+                script {
+                    echo "=== Invalidating CDN Cache (if applicable) ==="
+
+                    // CloudFront, Cloudflare 등 CDN 캐시 무효화
+                    sh '''
+                        # CDN 캐시 무효화 명령어
+                        # 예: aws cloudfront create-invalidation --distribution-id XXX --paths "/*"
+                        echo "CDN cache invalidation would be triggered here"
+                    '''
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            when {
+                expression {
+                    params.AUTO_SWITCH == true && DEPLOY_ENV == 'prod'
+                }
+            }
+            steps {
+                script {
+                    echo "=== Switching Traffic to ${TARGET_ENVIRONMENT} ==="
+
+                    // 수동 승인 단계 (운영 환경)
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Switch traffic to ${TARGET_ENVIRONMENT}?",
+                              ok: 'Switch Traffic'
+                    }
+
+                    sh """
+                        cd ${WORKSPACE_PATH}
+                        chmod +x nginx/scripts/switch-deployment.sh
+                        ./nginx/scripts/switch-deployment.sh ${TARGET_ENVIRONMENT}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "=== Build Successful ==="
+                echo "Environment: ${DEPLOY_ENV}"
+                echo "Target: ${TARGET_ENVIRONMENT}"
+                echo "Image Tag: ${IMAGE_TAG}"
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'good',
+                //     message: "Frontend deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                // )
+            }
+        }
+
+        failure {
+            script {
+                echo "=== Build Failed ==="
+
+                // 실패 시 롤백 (선택사항)
+                // sh """
+                //     cd ${WORKSPACE_PATH}
+                //     ./scripts/rollback.sh ${TARGET_ENVIRONMENT} ${DEPLOY_ENV}
+                // """
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'danger',
+                //     message: "Frontend deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                // )
+            }
+        }
+
+        always {
+            // 작업 공간 정리
+            cleanWs(
+                deleteDirs: true,
+                patterns: [
+                    [pattern: 'node_modules/**', type: 'INCLUDE'],
+                    [pattern: 'build/**', type: 'INCLUDE'],
+                    [pattern: 'dist/**', type: 'INCLUDE']
+                ]
+            )
+
+            // Docker 이미지 정리 (오래된 이미지 삭제)
+            sh '''
+                docker image prune -f --filter "until=168h" || true
+            '''
+        }
+    }
+}

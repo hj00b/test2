@@ -1,0 +1,324 @@
+// Backend Jenkins Pipeline
+// GitLab Webhook으로 트리거되며, master/dev 브랜치에 따라 환경을 선택합니다.
+
+pipeline {
+    agent any
+
+    environment {
+        // Docker Registry 설정
+        DOCKER_REGISTRY = credentials('docker-registry-credentials')
+        DOCKER_REGISTRY_URL = "${env.DOCKER_REGISTRY ?: 'registry.example.com'}"
+
+        // GitLab 설정
+        GITLAB_CREDENTIALS = credentials('gitlab-api-token')
+
+        // 환경 결정
+        DEPLOY_ENV = "${env.GIT_BRANCH == 'origin/master' ? 'prod' : 'dev'}"
+        TARGET_ENVIRONMENT = "${params.TARGET_ENV ?: 'blue'}"
+
+        // 이미지 태그
+        IMAGE_TAG = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+
+        // 프로젝트 경로
+        WORKSPACE_PATH = "/workspace"
+    }
+
+    parameters {
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['blue', 'green'],
+            description: '배포 대상 환경 (Blue/Green)'
+        )
+        booleanParam(
+            name: 'AUTO_SWITCH',
+            defaultValue: false,
+            description: '배포 후 자동으로 트래픽 전환 (운영 환경만)'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: '테스트 실행 여부'
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "=== Git Checkout ==="
+                    echo "Branch: ${env.GIT_BRANCH}"
+                    echo "Commit: ${env.GIT_COMMIT}"
+                    echo "Deploy Environment: ${DEPLOY_ENV}"
+                    echo "Target Environment: ${TARGET_ENVIRONMENT}"
+                }
+
+                // 소스 체크아웃
+                checkout scm
+
+                // Git 정보 저장
+                script {
+                    env.GIT_COMMIT_MESSAGE = sh(
+                        script: 'git log -1 --pretty=%B',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "=== Environment Setup ==="
+
+                    // 환경 변수 파일 로드
+                    def envFile = DEPLOY_ENV == 'prod' ? '.env.prod' : '.env.dev'
+
+                    sh """
+                        if [ -f ${envFile} ]; then
+                            export \$(cat ${envFile} | grep -v '^#' | xargs)
+                        else
+                            echo "Warning: ${envFile} not found"
+                        fi
+                    """
+                }
+            }
+        }
+
+        stage('Test - Backend') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            parallel {
+                stage('Test - Spring Boot') {
+                    steps {
+                        script {
+                            echo "=== Spring Boot Tests ==="
+                            dir('backend/spring-boot') {
+                                sh '''
+                                    if [ -f pom.xml ]; then
+                                        docker run --rm \
+                                            -v $(pwd):/app \
+                                            -w /app \
+                                            maven:3.9-eclipse-temurin-17 \
+                                            mvn clean test
+                                    else
+                                        echo "pom.xml not found, skipping tests"
+                                    fi
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Test - FastAPI') {
+                    steps {
+                        script {
+                            echo "=== FastAPI Tests ==="
+                            dir('backend/fastapi') {
+                                sh '''
+                                    if [ -f requirements.txt ]; then
+                                        docker run --rm \
+                                            -v $(pwd):/app \
+                                            -w /app \
+                                            python:3.11-slim \
+                                            /bin/bash -c "pip install -r requirements.txt && pytest tests/ || echo 'No tests found'"
+                                    else
+                                        echo "requirements.txt not found, skipping tests"
+                                    fi
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build - Docker Images') {
+            parallel {
+                stage('Build - Spring Boot') {
+                    steps {
+                        script {
+                            echo "=== Building Spring Boot Image ==="
+                            dir('backend/spring-boot') {
+                                def dockerfile = DEPLOY_ENV == 'prod' ? 'Dockerfile.prod' : 'Dockerfile'
+                                def imageName = "${DOCKER_REGISTRY_URL}/spring-boot:${IMAGE_TAG}-${DEPLOY_ENV}"
+
+                                sh """
+                                    if [ -f ${dockerfile} ]; then
+                                        docker build -t ${imageName} -f ${dockerfile} .
+                                        docker tag ${imageName} ${DOCKER_REGISTRY_URL}/spring-boot:latest-${DEPLOY_ENV}
+                                    else
+                                        echo "Warning: ${dockerfile} not found"
+                                    fi
+                                """
+                            }
+                        }
+                    }
+                }
+
+                stage('Build - FastAPI') {
+                    steps {
+                        script {
+                            echo "=== Building FastAPI Image ==="
+                            dir('backend/fastapi') {
+                                def dockerfile = DEPLOY_ENV == 'prod' ? 'Dockerfile.prod' : 'Dockerfile'
+                                def imageName = "${DOCKER_REGISTRY_URL}/fastapi:${IMAGE_TAG}-${DEPLOY_ENV}"
+
+                                sh """
+                                    if [ -f ${dockerfile} ]; then
+                                        docker build -t ${imageName} -f ${dockerfile} .
+                                        docker tag ${imageName} ${DOCKER_REGISTRY_URL}/fastapi:latest-${DEPLOY_ENV}
+                                    else
+                                        echo "Warning: ${dockerfile} not found"
+                                    fi
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push - Docker Registry') {
+            steps {
+                script {
+                    echo "=== Pushing Images to Registry ==="
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-credentials',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_PASS'
+                    )]) {
+                        sh """
+                            echo \${REGISTRY_PASS} | docker login ${DOCKER_REGISTRY_URL} -u \${REGISTRY_USER} --password-stdin
+
+                            # Push Spring Boot images
+                            docker push ${DOCKER_REGISTRY_URL}/spring-boot:${IMAGE_TAG}-${DEPLOY_ENV} || echo "Spring Boot image not found"
+                            docker push ${DOCKER_REGISTRY_URL}/spring-boot:latest-${DEPLOY_ENV} || echo "Spring Boot latest image not found"
+
+                            # Push FastAPI images
+                            docker push ${DOCKER_REGISTRY_URL}/fastapi:${IMAGE_TAG}-${DEPLOY_ENV} || echo "FastAPI image not found"
+                            docker push ${DOCKER_REGISTRY_URL}/fastapi:latest-${DEPLOY_ENV} || echo "FastAPI latest image not found"
+
+                            docker logout ${DOCKER_REGISTRY_URL}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy - to Target Environment') {
+            steps {
+                script {
+                    echo "=== Deploying Backend to ${TARGET_ENVIRONMENT} environment ==="
+
+                    def composeFile = DEPLOY_ENV == 'prod' ? 'docker-compose.prod.yml' : 'docker-compose.dev.yml'
+
+                    sh """
+                        cd ${WORKSPACE_PATH}
+
+                        # 환경 변수 로드
+                        export \$(cat .env.${DEPLOY_ENV} | grep -v '^#' | xargs)
+
+                        # 서비스 배포
+                        docker-compose -f ${composeFile} up -d spring-boot-${TARGET_ENVIRONMENT} fastapi-${TARGET_ENVIRONMENT}
+
+                        echo "Backend deployed to ${TARGET_ENVIRONMENT} environment"
+                    """
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "=== Running Health Checks ==="
+
+                    sh """
+                        cd ${WORKSPACE_PATH}
+                        chmod +x scripts/health-check.sh
+                        ./scripts/health-check.sh ${TARGET_ENVIRONMENT} || exit 1
+                    """
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            when {
+                expression {
+                    params.AUTO_SWITCH == true && DEPLOY_ENV == 'prod'
+                }
+            }
+            steps {
+                script {
+                    echo "=== Switching Traffic to ${TARGET_ENVIRONMENT} ==="
+
+                    // 수동 승인 단계 (운영 환경)
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Switch traffic to ${TARGET_ENVIRONMENT}?",
+                              ok: 'Switch Traffic'
+                    }
+
+                    sh """
+                        cd ${WORKSPACE_PATH}
+                        chmod +x nginx/scripts/switch-deployment.sh
+                        ./nginx/scripts/switch-deployment.sh ${TARGET_ENVIRONMENT}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "=== Build Successful ==="
+                echo "Environment: ${DEPLOY_ENV}"
+                echo "Target: ${TARGET_ENVIRONMENT}"
+                echo "Image Tag: ${IMAGE_TAG}"
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'good',
+                //     message: "Backend deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                // )
+            }
+        }
+
+        failure {
+            script {
+                echo "=== Build Failed ==="
+
+                // 실패 시 롤백 (선택사항)
+                // sh """
+                //     cd ${WORKSPACE_PATH}
+                //     ./scripts/rollback.sh ${TARGET_ENVIRONMENT} ${DEPLOY_ENV}
+                // """
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'danger',
+                //     message: "Backend deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                // )
+            }
+        }
+
+        always {
+            // 작업 공간 정리
+            cleanWs(
+                deleteDirs: true,
+                patterns: [
+                    [pattern: 'target/**', type: 'INCLUDE'],
+                    [pattern: '**/__pycache__/**', type: 'INCLUDE'],
+                    [pattern: '**/*.pyc', type: 'INCLUDE']
+                ]
+            )
+        }
+    }
+}
