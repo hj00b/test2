@@ -1,0 +1,24 @@
+{
+  "name": "test2",
+  "version": "1.0.0",
+  "description": "이 문서는 GitLab + Jenkins CI/CD 파이프라인과 Docker 기반 마이크로서비스 아키텍처의 전체 구축 과정을 단계별로 안내합니다.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hj00b/test2.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/hj00b/test2/issues"
+  },
+  "homepage": "https://github.com/hj00b/test2#readme",
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
