@@ -5,7 +5,7 @@ WORKDIR /app
 
 # 의존성 설치
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 # 소스 복사
 COPY . .
