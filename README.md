@@ -717,26 +717,64 @@ docker exec -it gitlab cat /etc/gitlab/initial_root_password
 
 ### 6.4 GitLab Webhook 설정
 
-GitLab 프로젝트에서 Jenkins로 자동 트리거를 설정합니다.
+GitLab에서 코드 푸시 시 Jenkins 빌드를 자동으로 트리거하는 Webhook을 설정합니다.
+
+**상세 가이드:** [📘 GitLab Webhook 설정 완전 가이드](docs/GITLAB_WEBHOOK_SETUP.md)
+
+#### 빠른 설정 (자동화 스크립트)
 
 ```bash
-# GitLab 프로젝트 설정 경로:
-# Settings > Webhooks
+# 1. Webhook Secret Token 생성
+WEBHOOK_SECRET=$(openssl rand -hex 32)
+echo "Secret Token: $WEBHOOK_SECRET"
 
-# Webhook URL 형식:
-# https://jenkins.example.com/project/<프로젝트명>
+# 2. 자동 설정 스크립트 실행
+cd gitlab/scripts
+chmod +x setup-webhook.sh
 
-# 또는 Generic Webhook Trigger 사용:
-# https://jenkins.example.com/generic-webhook-trigger/invoke?token=<TOKEN>
-
-# Trigger 이벤트:
-# ✓ Push events (master, dev 브랜치만)
-# ✓ Tag push events
-# ✓ Merge request events
-
-# Secret Token 생성 (Jenkins에서 사용)
-openssl rand -hex 32
+./setup-webhook.sh \
+  https://gitlab.example.com \
+  <PROJECT_ID> \
+  <GITLAB_ACCESS_TOKEN> \
+  https://jenkins.example.com/generic-webhook-trigger/invoke \
+  $WEBHOOK_SECRET
 ```
+
+#### 수동 설정 (GitLab UI)
+
+```bash
+# GitLab 프로젝트: Settings > Webhooks
+
+URL: https://jenkins.example.com/generic-webhook-trigger/invoke
+Secret Token: (생성한 Secret Token 입력)
+
+Trigger:
+  ✓ Push events (Branch filter: master,dev)
+  ✓ Tag push events
+  ✓ Merge request events
+
+Enable SSL verification: ✓
+
+Add webhook 클릭
+```
+
+#### 테스트
+
+```bash
+# GitLab에서 Webhook 테스트
+# Settings > Webhooks > Test > Push events
+
+# 예상 응답: HTTP 200 OK
+
+# 실제 Push 테스트
+git push origin master  # Jenkins 빌드 자동 시작
+```
+
+**관련 파일:**
+- `gitlab/scripts/setup-webhook.sh` - 자동 설정 스크립트
+- `gitlab/webhook-config.example.json` - 설정 예시
+- `jenkins/job-configs/webhook-job-dsl.groovy` - Jenkins Job DSL
+- `jenkins/job-configs/Jenkinsfile.webhook-example` - Pipeline 예시
 
 ### 6.5 GitLab Access Token 생성
 
@@ -744,13 +782,18 @@ openssl rand -hex 32
 # Jenkins에서 GitLab 접근용 Personal Access Token 생성
 # GitLab 웹 UI: User Settings > Access Tokens
 
-# Token name: jenkins-integration
-# Scopes:
-#   ✓ api
-#   ✓ read_repository
-#   ✓ write_repository
+Token name: jenkins-integration
+Scopes:
+  ✓ api
+  ✓ read_repository
+  ✓ write_repository
 
-# 생성된 토큰을 Jenkins Credentials에 저장
+생성 후 토큰 복사 (한 번만 표시됨)
+
+# Jenkins Credentials에 저장:
+# Jenkins > Manage Jenkins > Credentials > Global
+# Kind: GitLab API token
+# ID: gitlab-api-token
 ```
 
 ---
@@ -1077,118 +1120,161 @@ EOF
 
 ## 9. 블루-그린 배포
 
-### 9.1 블루-그린 스위칭 스크립트
+### 9.1 개요
+
+블루-그린 배포는 무중단 배포 전략으로, Blue와 Green 두 개의 동일한 환경을 유지하면서 트래픽을 전환합니다.
+
+**핵심 구성 요소:**
+- NGINX: 트래픽 라우팅 담당 (`active-env.conf`로 제어)
+- Blue/Green 컨테이너: 각 서비스(Spring Boot, FastAPI, React)의 두 벌 인스턴스
+- 트래픽 전환 스크립트: `nginx/scripts/switch-deployment.sh`
+- 헬스체크 스크립트: `scripts/health-check.sh`
+
+**상세 가이드:** [docs/BLUE_GREEN_DEPLOYMENT.md](docs/BLUE_GREEN_DEPLOYMENT.md)
+
+### 9.2 NGINX 설정
+
+NGINX가 `active-env.conf` 파일을 읽어서 Blue 또는 Green으로 트래픽을 라우팅합니다.
 
 ```bash
-cat > nginx/scripts/switch-deployment.sh << 'EOF'
-#!/bin/bash
-
-# 블루-그린 배포 환경 전환 스크립트
-# 사용법: ./switch-deployment.sh [blue|green]
-
-set -e
-
-TARGET_ENV=$1
-CURRENT_ENV=$(grep ACTIVE_ENVIRONMENT .env.prod | cut -d '=' -f2)
-
-if [ -z "$TARGET_ENV" ]; then
-    echo "현재 활성 환경: $CURRENT_ENV"
-    echo "사용법: $0 [blue|green]"
-    exit 1
-fi
-
-if [ "$TARGET_ENV" != "blue" ] && [ "$TARGET_ENV" != "green" ]; then
-    echo "오류: 환경은 'blue' 또는 'green'이어야 합니다"
-    exit 1
-fi
-
-if [ "$TARGET_ENV" == "$CURRENT_ENV" ]; then
-    echo "이미 $TARGET_ENV 환경이 활성화되어 있습니다"
-    exit 0
-fi
-
-echo "### 환경 전환: $CURRENT_ENV -> $TARGET_ENV"
-
-# 헬스체크
-echo "### 대상 환경 헬스체크..."
-./scripts/health-check.sh $TARGET_ENV
-
-if [ $? -ne 0 ]; then
-    echo "오류: $TARGET_ENV 환경의 헬스체크 실패"
-    exit 1
-fi
-
-# .env 파일 업데이트
-echo "### 환경 변수 업데이트..."
-sed -i "s/ACTIVE_ENVIRONMENT=.*/ACTIVE_ENVIRONMENT=$TARGET_ENV/" .env.prod
-
-# NGINX 설정 리로드
-echo "### NGINX 설정 리로드..."
-docker-compose exec nginx nginx -t
-docker-compose exec nginx nginx -s reload
-
-echo "### 환경 전환 완료: $TARGET_ENV 환경이 활성화되었습니다"
-
-# 모니터링 알림 (선택사항)
-# curl -X POST https://hooks.slack.com/... -d "{'text':'Production switched to $TARGET_ENV'}"
-EOF
-
-chmod +x nginx/scripts/switch-deployment.sh
+# nginx/conf.d/active-env.conf
+set $active_env "blue";  # 또는 "green"
 ```
 
-### 9.2 헬스체크 스크립트
+### 9.3 빠른 시작 가이드
+
+#### 스크립트 실행 권한 설정
 
 ```bash
-cat > scripts/health-check.sh << 'EOF'
-#!/bin/bash
-
-# 헬스체크 스크립트
-# 사용법: ./health-check.sh [blue|green]
-
-set -e
-
-ENV=${1:-blue}
-MAX_RETRIES=30
-RETRY_INTERVAL=2
-
-echo "### $ENV 환경 헬스체크 시작..."
-
-# 백엔드 서비스 헬스체크
-check_service() {
-    local service=$1
-    local port=$2
-    local endpoint=$3
-
-    echo "  - $service 체크 중..."
-
-    for i in $(seq 1 $MAX_RETRIES); do
-        if curl -sf "http://$service-$ENV:$port$endpoint" > /dev/null 2>&1; then
-            echo "    ✓ $service 정상"
-            return 0
-        fi
-        echo "    시도 $i/$MAX_RETRIES 실패, ${RETRY_INTERVAL}초 대기..."
-        sleep $RETRY_INTERVAL
-    done
-
-    echo "    ✗ $service 헬스체크 실패"
-    return 1
-}
-
-# Spring Boot 헬스체크
-check_service "spring-boot" "8080" "/actuator/health"
-
-# FastAPI 헬스체크
-check_service "fastapi" "8000" "/health"
-
-# React 헬스체크
-check_service "react" "80" "/"
-
-echo "### 모든 서비스 헬스체크 통과!"
-exit 0
-EOF
-
-chmod +x scripts/health-check.sh
+# 모든 스크립트 실행 가능하게 만들기
+chmod +x scripts/setup-permissions.sh
+./scripts/setup-permissions.sh
 ```
+
+#### 배포 프로세스
+
+```bash
+# 1. Green 환경에 새 버전 배포 (Jenkins 또는 수동)
+docker-compose -f docker-compose.prod.yml up -d \
+  spring-boot-green \
+  fastapi-green \
+  react-green
+
+# 2. Green 환경 헬스체크
+./scripts/health-check.sh green
+
+# 3. 트래픽 전환 (Blue → Green)
+./nginx/scripts/switch-deployment.sh green
+
+# 4. 문제 발생 시 즉시 롤백
+./nginx/scripts/switch-deployment.sh blue
+```
+
+#### Jenkins를 통한 자동 배포
+
+```bash
+# 1. GitLab에 코드 푸시
+git push origin master  # 운영 환경
+
+# 2. Jenkins 파이프라인 자동 실행
+#    - 빌드 & 테스트
+#    - Docker 이미지 빌드
+#    - Green 환경에 배포
+#    - 헬스체크 수행
+
+# 3. 수동 승인 후 트래픽 전환
+#    Jenkins에서 "Switch Traffic" 승인
+```
+
+### 9.4 주요 스크립트
+
+#### 트래픽 전환 스크립트
+
+파일: `nginx/scripts/switch-deployment.sh`
+
+**기능:**
+- Blue/Green 환경 헬스체크
+- `active-env.conf` 파일 업데이트
+- NGINX 설정 테스트 및 리로드
+- 실패 시 자동 롤백
+
+**사용법:**
+```bash
+./nginx/scripts/switch-deployment.sh green  # Green으로 전환
+./nginx/scripts/switch-deployment.sh blue   # Blue로 롤백
+```
+
+#### 헬스체크 스크립트
+
+파일: `scripts/health-check.sh`
+
+**기능:**
+- 모든 서비스 컨테이너 실행 확인
+- 헬스 엔드포인트 응답 확인
+- 리소스 사용량 모니터링
+- 에러 로그 확인
+
+**사용법:**
+```bash
+./scripts/health-check.sh green  # Green 환경 체크
+./scripts/health-check.sh blue   # Blue 환경 체크
+./scripts/health-check.sh        # 현재 활성 환경 체크
+```
+
+### 9.5 배포 시나리오
+
+**정상 배포 흐름:**
+```
+1. 초기: Blue 활성 (사용자 트래픽)
+         Green 대기
+
+2. 배포: Blue 활성 (계속 서비스)
+         Green 새 버전 배포 중
+
+3. 준비: Blue 활성 (계속 서비스)
+         Green 헬스체크 통과 ✓
+
+4. 전환: Blue 대기
+         Green 활성 (사용자 트래픽 전환)
+
+5. 완료: Blue 롤백 대기
+         Green 운영 중
+```
+
+**롤백 흐름:**
+```
+문제 발견 → ./nginx/scripts/switch-deployment.sh blue → 즉시 복구 (5-10초)
+```
+
+### 9.6 모니터링
+
+```bash
+# 현재 활성 환경 확인
+cat nginx/conf.d/active-env.conf
+
+# 컨테이너 상태 확인
+docker ps --filter "name=spring-boot"
+docker ps --filter "name=fastapi"
+docker ps --filter "name=react"
+
+# 로그 확인
+docker logs -f spring-boot-blue
+docker logs -f spring-boot-green
+```
+
+### 9.7 상세 문서
+
+블루-그린 배포의 상세한 작동 원리, 트러블슈팅 가이드, 롤백 절차는 다음 문서를 참조하세요:
+
+**[📘 블루-그린 배포 완전 가이드](docs/BLUE_GREEN_DEPLOYMENT.md)**
+
+이 문서에는 다음 내용이 포함되어 있습니다:
+- 아키텍처 상세 설명
+- Jenkins 파이프라인 통합
+- NGINX 라우팅 메커니즘
+- 트러블슈팅 가이드
+- 롤백 절차
+- 실제 사용 예시
 
 ---
 

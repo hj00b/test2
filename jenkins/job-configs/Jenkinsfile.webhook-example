@@ -1,0 +1,348 @@
+// Jenkinsfile - Generic Webhook Trigger 예시
+// GitLab Webhook에서 파라미터를 받아 배포하는 파이프라인
+
+// ========================================
+// Pipeline 설정
+// ========================================
+pipeline {
+    agent any
+
+    // Generic Webhook Trigger 설정
+    // Jenkins UI에서 설정하거나, 이 파이프라인을 사용할 때 설정 필요
+    /*
+    triggers {
+        GenericTrigger(
+            // GitLab Webhook에서 추출할 변수
+            genericVariables: [
+                [key: 'GIT_BRANCH', value: '$.ref', regexpFilter: 'refs/heads/'],
+                [key: 'GIT_COMMIT', value: '$.checkout_sha'],
+                [key: 'PROJECT_NAME', value: '$.project.name'],
+                [key: 'USER_NAME', value: '$.user_name'],
+                [key: 'COMMIT_MESSAGE', value: '$.commits[0].message'],
+                [key: 'EVENT_TYPE', value: '$.object_kind']
+            ],
+
+            // Webhook 인증 토큰
+            token: 'gitlab-webhook-secret',
+
+            // 빌드 트리거 조건 (master, dev 브랜치만)
+            regexpFilterText: '$GIT_BRANCH',
+            regexpFilterExpression: '^(master|dev)$',
+
+            // 빌드 원인 표시
+            causeString: 'Triggered by GitLab: $USER_NAME pushed to $GIT_BRANCH',
+
+            // 디버깅용
+            printContributedVariables: true,
+            printPostContent: false
+        )
+    }
+    */
+
+    environment {
+        // Webhook에서 받은 변수를 환경변수로 설정
+        DEPLOY_ENV = "${env.GIT_BRANCH == 'master' ? 'prod' : 'dev'}"
+        IMAGE_TAG = "${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+
+        // Docker Registry
+        DOCKER_REGISTRY = credentials('docker-registry-credentials')
+        DOCKER_REGISTRY_URL = "${env.DOCKER_REGISTRY_URL ?: 'registry.example.com'}"
+
+        // GitLab
+        GITLAB_CREDENTIALS = credentials('gitlab-api-token')
+    }
+
+    parameters {
+        // Jenkins UI에서 수동 실행 시 사용할 파라미터
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['blue', 'green'],
+            description: '배포 대상 환경 (Blue/Green)'
+        )
+        booleanParam(
+            name: 'AUTO_SWITCH',
+            defaultValue: false,
+            description: '배포 후 자동으로 트래픽 전환'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: '테스트 실행 여부'
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Webhook Info') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "GitLab Webhook Triggered Build"
+                    echo "========================================="
+                    echo "Branch: ${env.GIT_BRANCH ?: 'N/A'}"
+                    echo "Commit: ${env.GIT_COMMIT ?: 'N/A'}"
+                    echo "Project: ${env.PROJECT_NAME ?: 'N/A'}"
+                    echo "User: ${env.USER_NAME ?: 'N/A'}"
+                    echo "Event: ${env.EVENT_TYPE ?: 'N/A'}"
+                    echo "Deploy Environment: ${DEPLOY_ENV}"
+                    echo "Image Tag: ${IMAGE_TAG}"
+                    echo "========================================="
+                }
+            }
+        }
+
+        stage('Validate Branch') {
+            steps {
+                script {
+                    // 브랜치 검증
+                    def validBranches = ['master', 'dev']
+                    def currentBranch = env.GIT_BRANCH ?: 'unknown'
+
+                    if (!validBranches.contains(currentBranch)) {
+                        error("Invalid branch: ${currentBranch}. Only master and dev are allowed.")
+                    }
+
+                    echo "✓ Branch validation passed: ${currentBranch}"
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "=== Git Checkout ==="
+
+                    // GitLab에서 소스 체크아웃
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${env.GIT_COMMIT}"]],
+                        userRemoteConfigs: [[
+                            url: 'https://gitlab.example.com/group/project.git',
+                            credentialsId: 'gitlab-credentials'
+                        ]],
+                        extensions: [
+                            [$class: 'CloneOption', depth: 1, shallow: true],
+                            [$class: 'CheckoutOption', timeout: 10]
+                        ]
+                    ])
+
+                    // 커밋 정보 저장
+                    env.GIT_COMMIT_MESSAGE = sh(
+                        script: 'git log -1 --pretty=%B',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Commit Message: ${env.GIT_COMMIT_MESSAGE}"
+                }
+            }
+        }
+
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "=== Environment Setup ==="
+
+                    // 환경 변수 파일 로드
+                    def envFile = DEPLOY_ENV == 'prod' ? '.env.prod' : '.env.dev'
+
+                    if (fileExists(envFile)) {
+                        sh """
+                            export \$(cat ${envFile} | grep -v '^#' | xargs)
+                            echo "Loaded environment from ${envFile}"
+                        """
+                    } else {
+                        echo "Warning: ${envFile} not found"
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            parallel {
+                stage('Test - Backend') {
+                    steps {
+                        script {
+                            echo "=== Backend Tests ==="
+                            // 실제 테스트 명령어로 교체
+                            sh 'echo "Running backend tests..."'
+                        }
+                    }
+                }
+                stage('Test - Frontend') {
+                    steps {
+                        script {
+                            echo "=== Frontend Tests ==="
+                            // 실제 테스트 명령어로 교체
+                            sh 'echo "Running frontend tests..."'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    echo "=== Building Docker Images ==="
+
+                    def dockerfile = DEPLOY_ENV == 'prod' ? 'Dockerfile.prod' : 'Dockerfile'
+                    def imageName = "${DOCKER_REGISTRY_URL}/app:${IMAGE_TAG}-${DEPLOY_ENV}"
+
+                    sh """
+                        docker build -t ${imageName} -f ${dockerfile} .
+                        docker tag ${imageName} ${DOCKER_REGISTRY_URL}/app:latest-${DEPLOY_ENV}
+                    """
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                script {
+                    echo "=== Pushing to Docker Registry ==="
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-credentials',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_PASS'
+                    )]) {
+                        sh """
+                            echo \${REGISTRY_PASS} | docker login ${DOCKER_REGISTRY_URL} -u \${REGISTRY_USER} --password-stdin
+                            docker push ${DOCKER_REGISTRY_URL}/app:${IMAGE_TAG}-${DEPLOY_ENV}
+                            docker push ${DOCKER_REGISTRY_URL}/app:latest-${DEPLOY_ENV}
+                            docker logout ${DOCKER_REGISTRY_URL}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    echo "=== Deploying to ${params.TARGET_ENV} environment ==="
+
+                    def composeFile = DEPLOY_ENV == 'prod' ? 'docker-compose.prod.yml' : 'docker-compose.dev.yml'
+
+                    sh """
+                        cd /workspace
+                        docker-compose -f ${composeFile} up -d spring-boot-${params.TARGET_ENV} fastapi-${params.TARGET_ENV} react-${params.TARGET_ENV}
+                    """
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "=== Running Health Checks ==="
+
+                    sh """
+                        cd /workspace
+                        chmod +x scripts/health-check.sh
+                        ./scripts/health-check.sh ${params.TARGET_ENV}
+                    """
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            when {
+                expression {
+                    params.AUTO_SWITCH == true && DEPLOY_ENV == 'prod'
+                }
+            }
+            steps {
+                script {
+                    echo "=== Switching Traffic to ${params.TARGET_ENV} ==="
+
+                    // 운영 환경에서는 수동 승인 필요
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Switch traffic to ${params.TARGET_ENV}?",
+                              ok: 'Switch Traffic'
+                    }
+
+                    sh """
+                        cd /workspace
+                        chmod +x nginx/scripts/switch-deployment.sh
+                        ./nginx/scripts/switch-deployment.sh ${params.TARGET_ENV}
+                    """
+                }
+            }
+        }
+
+        stage('GitLab Commit Status') {
+            steps {
+                script {
+                    echo "=== Updating GitLab Commit Status ==="
+
+                    // GitLab에 빌드 성공 상태 업데이트
+                    sh """
+                        curl --request POST \
+                            --header "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS}" \
+                            --data "state=success&name=jenkins-build&target_url=${BUILD_URL}" \
+                            "https://gitlab.example.com/api/v4/projects/\${PROJECT_ID}/statuses/\${GIT_COMMIT}"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "=== Build Successful ==="
+                echo "Environment: ${DEPLOY_ENV}"
+                echo "Target: ${params.TARGET_ENV}"
+                echo "Image Tag: ${IMAGE_TAG}"
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'good',
+                //     message: "✓ Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nBranch: ${env.GIT_BRANCH}\nCommit: ${env.GIT_COMMIT_MESSAGE}"
+                // )
+            }
+        }
+
+        failure {
+            script {
+                echo "=== Build Failed ==="
+
+                // GitLab에 빌드 실패 상태 업데이트
+                sh """
+                    curl --request POST \
+                        --header "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS}" \
+                        --data "state=failed&name=jenkins-build&target_url=${BUILD_URL}" \
+                        "https://gitlab.example.com/api/v4/projects/\${PROJECT_ID}/statuses/\${GIT_COMMIT}" || true
+                """
+
+                // Slack 알림 (선택사항)
+                // slackSend(
+                //     color: 'danger',
+                //     message: "✗ Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nBranch: ${env.GIT_BRANCH}"
+                // )
+            }
+        }
+
+        always {
+            // 작업 공간 정리
+            cleanWs(
+                deleteDirs: true,
+                patterns: [
+                    [pattern: 'target/**', type: 'INCLUDE'],
+                    [pattern: '**/__pycache__/**', type: 'INCLUDE'],
+                    [pattern: '**/*.pyc', type: 'INCLUDE']
+                ]
+            )
+        }
+    }
+}

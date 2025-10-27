@@ -1,0 +1,169 @@
+{
+  "comment": "GitLab Webhook 설정 예시",
+  "description": "이 파일은 GitLab Webhook 설정의 참고용입니다. GitLab UI 또는 API로 설정할 때 사용하세요.",
+
+  "webhook": {
+    "url": "https://jenkins.example.com/generic-webhook-trigger/invoke",
+    "token": "YOUR_WEBHOOK_SECRET_TOKEN_HERE",
+    "push_events": true,
+    "push_events_branch_filter": "master,dev",
+    "tag_push_events": true,
+    "merge_requests_events": true,
+    "enable_ssl_verification": true,
+    "note_events": false,
+    "wiki_page_events": false,
+    "deployment_events": false,
+    "job_events": false,
+    "pipeline_events": false,
+    "releases_events": false,
+    "confidential_note_events": false,
+    "confidential_issues_events": false,
+    "issues_events": false
+  },
+
+  "jenkins_parameters": {
+    "comment": "Jenkins Generic Webhook Trigger에서 추출할 파라미터",
+    "parameters": [
+      {
+        "name": "GIT_BRANCH",
+        "expression": "$.ref",
+        "description": "Git 브랜치 (예: refs/heads/master)"
+      },
+      {
+        "name": "GIT_COMMIT",
+        "expression": "$.checkout_sha",
+        "description": "Git Commit SHA"
+      },
+      {
+        "name": "PROJECT_NAME",
+        "expression": "$.project.name",
+        "description": "GitLab 프로젝트 이름"
+      },
+      {
+        "name": "USER_NAME",
+        "expression": "$.user_name",
+        "description": "커밋한 사용자 이름"
+      },
+      {
+        "name": "USER_EMAIL",
+        "expression": "$.user_email",
+        "description": "커밋한 사용자 이메일"
+      },
+      {
+        "name": "COMMIT_MESSAGE",
+        "expression": "$.commits[0].message",
+        "description": "커밋 메시지"
+      },
+      {
+        "name": "EVENT_TYPE",
+        "expression": "$.object_kind",
+        "description": "이벤트 타입 (push, tag_push, merge_request)"
+      }
+    ]
+  },
+
+  "trigger_rules": {
+    "comment": "Jenkins에서 빌드를 트리거할 조건",
+    "rules": [
+      {
+        "description": "Master 브랜치 푸시 시 운영 배포",
+        "condition": "$.ref == 'refs/heads/master'",
+        "action": "Trigger production deployment"
+      },
+      {
+        "description": "Dev 브랜치 푸시 시 개발 배포",
+        "condition": "$.ref == 'refs/heads/dev'",
+        "action": "Trigger development deployment"
+      },
+      {
+        "description": "Tag 푸시 시 릴리즈 빌드",
+        "condition": "$.object_kind == 'tag_push'",
+        "action": "Trigger release build"
+      },
+      {
+        "description": "Merge Request 시 PR 빌드",
+        "condition": "$.object_kind == 'merge_request'",
+        "action": "Trigger PR validation build"
+      }
+    ]
+  },
+
+  "example_payload": {
+    "comment": "GitLab에서 전송하는 Webhook Payload 예시 (Push Event)",
+    "object_kind": "push",
+    "event_name": "push",
+    "ref": "refs/heads/master",
+    "checkout_sha": "abc123def456",
+    "user_name": "John Doe",
+    "user_email": "john@example.com",
+    "project": {
+      "id": 123,
+      "name": "my-project",
+      "web_url": "https://gitlab.example.com/group/my-project"
+    },
+    "commits": [
+      {
+        "id": "abc123def456",
+        "message": "feat: Add new feature",
+        "timestamp": "2025-10-27T10:00:00+00:00",
+        "author": {
+          "name": "John Doe",
+          "email": "john@example.com"
+        }
+      }
+    ],
+    "total_commits_count": 1
+  },
+
+  "setup_steps": [
+    "1. GitLab에서 Personal Access Token 생성 (api 권한)",
+    "2. Jenkins에서 Webhook Secret Token 생성 (Credentials에 저장)",
+    "3. gitlab/scripts/setup-webhook.sh 스크립트 실행",
+    "4. Jenkins Job에서 Generic Webhook Trigger 플러그인 설정",
+    "5. 테스트 커밋으로 Webhook 동작 확인"
+  ],
+
+  "gitlab_ui_setup": {
+    "description": "GitLab UI에서 수동으로 Webhook 설정하는 방법",
+    "steps": [
+      "1. GitLab 프로젝트 > Settings > Webhooks",
+      "2. URL: https://jenkins.example.com/generic-webhook-trigger/invoke",
+      "3. Secret Token: (Jenkins와 동일한 토큰 입력)",
+      "4. Trigger:",
+      "   - ☑ Push events (master, dev 브랜치만)",
+      "   - ☑ Tag push events",
+      "   - ☑ Merge request events",
+      "5. Enable SSL verification: ☑",
+      "6. Add webhook 클릭",
+      "7. Test > Push events로 테스트"
+    ]
+  },
+
+  "troubleshooting": {
+    "common_issues": [
+      {
+        "issue": "Webhook이 트리거되지 않음",
+        "solutions": [
+          "GitLab에서 Webhook 로그 확인 (Project Settings > Webhooks > Recent Deliveries)",
+          "Jenkins URL이 GitLab에서 접근 가능한지 확인",
+          "방화벽 설정 확인",
+          "GitLab Admin Area > Settings > Network > Outbound requests 설정 확인"
+        ]
+      },
+      {
+        "issue": "401 Unauthorized 에러",
+        "solutions": [
+          "Secret Token이 Jenkins와 동일한지 확인",
+          "Jenkins Generic Webhook Trigger 설정에서 Token 확인"
+        ]
+      },
+      {
+        "issue": "SSL 인증서 오류",
+        "solutions": [
+          "GitLab Webhook 설정에서 'Enable SSL verification' 해제 (테스트 환경)",
+          "Let's Encrypt 인증서가 올바르게 설정되었는지 확인"
+        ]
+      }
+    ]
+  }
+}
